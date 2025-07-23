@@ -5,30 +5,38 @@ import os
 import torch
 
 
-def convert_yolov8_to_onnx():
-    # 1. 加载预训练模型
-    model = YOLO('yolov5n.pt')  # 替换为你的.pt文件路径
-
-    # 2. 导出为ONNX格式
-    model.export(
-        format='onnx',  # 输出格式
-        dynamic=True,  # 支持动态batch
-        simplify=True,  # 简化模型
-        opset=12,  # ONNX算子集版本
-        imgsz=(640, 640)  # 输入尺寸
-    )
-    print("ONNX转换完成！")
-
-
-
-
-def convert_onnx_to_xml(onnx_path: str, output_dir: str = "./openvino_models"):
+def convert_yolov8_to_onnx(pt_path: str, output_dir: str = "runs/onnx", onnx_name: str = "model.onnx") -> str:
     """
+    将 yolov8/yolov5 .pt 模型转换为 onnx
+    Args:
+        pt_path: 本地 .pt 文件路径
+        output_dir: ONNX模型保存目录
+        onnx_name: 输出的ONNX模型名
+    Returns:
+        ONNX 模型路径
+    """
+    model = YOLO(pt_path)
+    output_path = f"{output_dir}/{onnx_name}"
+
+    model.export(
+        format='onnx',
+        dynamic=True,
+        simplify=True,
+        opset=12,
+        imgsz=(640, 640)
+    )
+    print(f"ONNX模型导出完成: {output_path}")
+    return output_path
+
+
+"""
+def convert_onnx_to_xml(onnx_path: str, output_dir: str = "./openvino_models"):
+    
     将ONNX模型转换为OpenVINO的XML/BIN格式
     Args:
         onnx_path: 输入的ONNX模型路径
         output_dir: 输出目录（默认当前目录下的openvino_models文件夹）
-    """
+    
     # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)
 
@@ -60,11 +68,10 @@ def convert_onnx_to_xml(onnx_path: str, output_dir: str = "./openvino_models"):
     except Exception as e:
         print(f"转换失败: {str(e)}")
         return None
-
+"""
 
 if __name__ == "__main__":
     convert_yolov8_to_onnx()
 
     onnx_path = "yolov5nu.onnx"
     # 转换为OpenVINO格式
-    convert_onnx_to_xml(onnx_path)
