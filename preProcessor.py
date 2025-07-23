@@ -7,6 +7,9 @@ import math
 import openvino as ov
 #from openvino.tools import mo
 import torch
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
 
 import opPostprocessor
 
@@ -64,17 +67,17 @@ def preprocess_and_display(img_path, img_size=640):
 
     plt.subplot(1, 3, 1)
     plt.imshow(orig_img[:, :, ::-1])  # 显示原始图像（BGR转RGB）
-    plt.title(f"原始图像: {w0}x{h0}")
+    plt.title(f"original{w0}x{h0}")
     plt.axis('off')
 
     plt.subplot(1, 3, 2)
     plt.imshow(resized_img)
-    plt.title(f"缩放后: {w1}x{h1}")
+    plt.title(f"scaled {w1}x{h1}")
     plt.axis('off')
 
     plt.subplot(1, 3, 3)
     plt.imshow(padded_img)
-    plt.title(f"填充后: {padded_img.shape[1]}x{padded_img.shape[0]}")
+    plt.title(f"after padding {padded_img.shape[1]}x{padded_img.shape[0]}")
     plt.axis('off')
 
     plt.tight_layout()
@@ -94,29 +97,56 @@ def preprocess_and_display(img_path, img_size=640):
     return input_tensor, orig_img, resized_img, padded_img, (dw, dh, r, w0, h0)
 
 
-def run_inference(input_tensor, xml_path, device="CPU"):
+def run_trt_inference(input_tensor, engine_path="yolov8n.engine"):
     """
-       使用 OpenVINO IR 模型进行推理（适配 YOLOv8 输出）
+    使用 TensorRT engine 文件进行推理
+    输入：
+        input_tensor: numpy 数组 (1, 3, 640, 640)，float32
+    输出：
+        pred: numpy 数组，shape=(1, 84, 8400)
+    """
+    assert input_tensor.dtype == np.float32, "输入必须是 float32"
+    assert input_tensor.shape[0] == 1, "仅支持 batch_size=1"
 
-       参数:
-           input_tensor: 预处理后的图像 (B,C,H,W)，float32
-           xml_path: OpenVINO .xml 模型路径
-           device: 推理设备，"CPU" 或 "GPU"
-       返回:
-           preds: numpy 数组，形状为 (1, 84, 8400)
-       """
-    core = ov.Core()
-    model = core.read_model(model=xml_path, weights=xml_path.replace(".xml", ".bin"))
-    compiled_model = core.compile_model(model, device)
+    TRT_LOGGER = trt.Logger()
+    with open(engine_path, "rb") as f:
+        engine = trt.Runtime(TRT_LOGGER).deserialize_cuda_engine(f.read())
+    context = engine.create_execution_context()
 
+    # ✅ 设置动态 shape（YOLOv8 是动态模型）
+    input_name = engine.get_binding_name(0)  # "images"
+    context.set_binding_shape(0, input_tensor.shape)  # 如 (1, 3, 640, 640)
 
-    output_layer = compiled_model.output(0)
-    result = compiled_model([input_tensor])[output_layer]  # shape: (1, 84, 8400)
-    preds = np.array(result)
+    # 获取输入输出索引
+    input_idx = engine.get_binding_index(input_name)
+    output_idx = engine.get_binding_index("output0")  # 通常为 "output0"
 
-    print(f"推理完成，输出 shape: {preds.shape}")
-    return preds
+    # 分配 GPU 显存
+    input_tensor = np.ascontiguousarray(input_tensor)  # 保证内存连续
+    input_nbytes = input_tensor.nbytes
 
+    output_shape = context.get_binding_shape(output_idx)  # eg: (1, 84, 8400)
+    output_nbytes = np.prod(output_shape) * np.dtype(np.float32).itemsize
+
+    d_input = cuda.mem_alloc(input_nbytes)
+    d_output = cuda.mem_alloc(output_nbytes)
+
+    # 拷贝输入到 GPU
+    cuda.memcpy_htod(d_input, input_tensor)
+
+    # 推理
+    bindings = [None] * engine.num_bindings
+    bindings[input_idx] = int(d_input)
+    bindings[output_idx] = int(d_output)
+
+    context.execute_v2(bindings)
+
+    # 拷贝输出回 CPU
+    output = np.empty(output_shape, dtype=np.float32)
+    cuda.memcpy_dtoh(output, d_output)
+
+    print(f"✅ 推理完成，输出 shape: {output.shape}")
+    return output
 
 # （左上角坐标，右下角坐标）转 （检测框中心坐标，检测框宽高）
 def xyxy2xywh(x):
@@ -161,18 +191,31 @@ def ini(image_path: str = "runs/true.jpg"):
         input_tensor, orig_img, resized_img, padded_img, (dw, dh, r, w0, h0) = preprocess_and_display(
             image_path, img_size=640
         )
-
+        """
         # 载入 ONNX 模型并进行推理
-        sess = rt.InferenceSession('yolov8n.onnx')
+        sess = rt.InferenceSession(
+            'yolov8n.onnx',
+            providers=['CUDAExecutionProvider', 'CPUExecutionProvider']  # CUDA for GPU
+        )
         input_name = sess.get_inputs()[0].name
         label_name = sess.get_outputs()[0].name
         pred = sess.run([label_name], {input_name: input_tensor})[0]
+        """
+        # 使用 TensorRT 推理 ONNX 模型
+        sess = rt.InferenceSession("yolov8n.onnx", providers=["TensorrtExecutionProvider", "CUDAExecutionProvider"])
+        input_name = sess.get_inputs()[0].name
+        output_name = sess.get_outputs()[0].name
+        # 假设 input_tensor 是 shape=(1,3,640,640)，float32
+        pred = sess.run([output_name], {input_name: input_tensor})[0]
+        print("推理完成，输出 shape:", pred.shape)
 
         # 后处理
         postprocessor = opPostprocessor.YOLOv8PostProcessor(conf_thres=0.5, iou_thres=0.4)
         results = postprocessor.post_process(pred, dw, dh, r, w0, h0)
+        print(type(results))
         result = postprocessor.cod_trf(results, img, padded_img)
         image = postprocessor.draw(result, img, postprocessor.coco_dict)
+        print(type(result))
 
         # 输出路径
         out_path = "runs/detect/myPredict/"
@@ -189,3 +232,5 @@ def ini(image_path: str = "runs/true.jpg"):
 
 if __name__ == "__main__":
     ini()
+
+
