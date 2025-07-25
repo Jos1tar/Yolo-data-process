@@ -11,6 +11,7 @@ class YOLOv8PostProcessor:
         self.conf_thres = conf_thres
         self.iou_thres = iou_thres
 
+        # 简化的COCO类别列表（保持原样）
         self.coco_names = [
             'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
             'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
@@ -27,243 +28,277 @@ class YOLOv8PostProcessor:
             'scissors', 'teddy bear', 'hair drier', 'toothbrush'
         ]
         self.coco_dict = {idx: name for idx, name in enumerate(self.coco_names)}
-
-
-        # 图像尺寸（模型训练尺寸）
         self.model_size = 640
 
-    def xywh2xyxy(self,*box):
-        """
-        将xywh转换为左上角点和左下角点
+    def xywh2xyxy(self, x, y, w, h):
+        """将中心点坐标格式转换为左上右下角点格式
         Args:
-            box:
-        Returns: x1y1x2y2
+            x: 中心点x坐标
+            y: 中心点y坐标
+            w: 宽度
+            h: 高度
+        Returns:
+            [x1, y1, x2, y2]: 左上右下角点坐标
         """
-        ret = [box[0] - box[2] // 2, box[1] - box[3] // 2, \
-               box[0] + box[2] // 2, box[1] + box[3] // 2]
-        return ret
+        x1 = x - w / 2
+        y1 = y - h / 2
+        x2 = x + w / 2
+        y2 = y + h / 2
+        return np.array([x1, y1, x2, y2])  # 返回numpy数组便于后续计算
 
-    def get_inter(self,box1, box2):
-        """
-        计算相交部分面积
+    def get_iou(self, box1, box2):
+        """计算两个框的IoU
         Args:
-            box1: 第一个框
-            box2: 第二个
-        Returns: 相交部分的面积
+            box1: [x1, y1, x2, y2] 格式的框
+            box2: [x1, y1, x2, y2] 格式的框
+        Returns:
+            iou: 交并比
         """
-        x1, y1, x2, y2 = self.xywh2xyxy(*box1)
-        x3, y3, x4, y4 = self.xywh2xyxy(*box2)
-        # 验证是否存在交集
-        if x1 >= x4 or x2 <= x3:
-            return 0
-        if y1 >= y4 or y2 <= y3:
-            return 0
-        # 将x1,x2,x3,x4排序，因为已经验证了两个框相交，所以x3-x2就是交集的宽
-        x_list = sorted([x1, x2, x3, x4])
-        x_inter = x_list[2] - x_list[1]
-        # 将y1,y2,y3,y4排序，因为已经验证了两个框相交，所以y3-y2就是交集的宽
-        y_list = sorted([y1, y2, y3, y4])
-        y_inter = y_list[2] - y_list[1]
-        # 计算交集的面积
-        inter = x_inter * y_inter
-        return inter
+        # 计算交集区域的坐标
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
 
-    def get_iou(self,box1, box2):
-        """
-        计算交并比： (A n B)/(A + B - A n B)
-        Args:
-            box1: 第一个框
-            box2: 第二个框
-        Returns:  # 返回交并比的值
-        """
-        box1_area = box1[2] * box1[3]  # 计算第一个框的面积
-        box2_area = box2[2] * box2[3]  # 计算第二个框的面积
-        inter_area = self.get_inter(box1, box2)
-        union = box1_area + box2_area - inter_area  # (A n B)/(A + B - A n B)
-        iou = inter_area / union
+        # 计算交集面积
+        inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+
+        # 计算两个框的面积
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+
+        # 计算IoU
+        union_area = box1_area + box2_area - inter_area
+        iou = inter_area / (union_area + 1e-6)  # 添加epsilon避免除0
+
         return iou
 
+    def non_max_suppression(self, boxes, scores):
+        """简化的非极大值抑制实现"""
+        if len(boxes) == 0:
+            return []
 
-    def post_process(self, preds, dw, dh, r, w0, h0):
-        """完全重构的后处理函数"""
-        # 转换形状 (B, C, N) -> (B, N, C)
-        if isinstance(preds, np.ndarray):
-            preds = np.transpose(preds, (0, 2, 1))
-        elif isinstance(preds, torch.Tensor):
-            preds = preds.permute(0, 2, 1).cpu().numpy()
+        # 按置信度排序
+        indices = np.argsort(scores)[::-1]
+        boxes = boxes[indices]
+        scores = scores[indices]
 
-        batch_size = preds.shape[0]
+        keep = []
+        while boxes.shape[0] > 0:
+            # 保留当前最高置信度的框
+            keep.append(indices[0])
 
+            if boxes.shape[0] == 1:
+                break
 
-        for b in range(batch_size):#其实b只有1，但是当有多batch可以适用
-            pred = preds[b] # [num_preds, 84]
-          #无激活函数
-            pred_class = pred[..., 4:]#后面80个，因为是yolo8没有单独置信度
-            pred_conf = np.max(pred_class, axis=-1)#此处是后面84个的最大值
-            pred = np.insert(pred, 4, pred_conf, axis=-1)      #此处已经是（8400，85）
-            """
-            # sigmoid 仅应用到 [4:]（即 80 个类别）
-            pred[:, 4:] = 1 / (1 + np.exp(-pred[:, 4:]))
-            pred_class = pred[..., 4:]
+            # 计算当前框与其余框的IoU
+            ious = np.array([self.get_iou(boxes[0], boxes[i]) for i in range(1, boxes.shape[0])])
 
-            # 最大类别概率作为置信度
-            pred_conf = np.max(pred[:, 4:], axis=-1)
+            # 找到IoU小于阈值的框
+            idx = np.where(ious < self.iou_thres)[0] + 1
 
-            # 插入置信度列
-            pred = np.insert(pred, 4, pred_conf, axis=-1)  # shape: (8400, 85)
+            # 保留这些框
+            boxes = boxes[idx]
+            indices = indices[idx]
 
-            #bbox = pred[:, :4]  # [x, y, w, h] 相对坐标  
-            """
+        return keep
 
+    def post_process(self, preds, meta_list):
+        preds = np.transpose(preds, (0, 2, 1))  # (B, N, C)
+        results_all = []
 
-            box = pred[pred[..., 4] > self.conf_thres]  # 置信度筛选
+        for b in range(preds.shape[0]):
+            pred = preds[b]  # shape (8400, 84)
+            # 前面不变：转置后得到 pred (8400,84)
+            boxes = pred[:, :4]
+            class_confs = pred[:, 4:]  # 80 维 class-aware scores
 
-            cls_conf = box[..., 5:]#后面80个置信度筛选后的
-            cls = []
-            for i in range(len(cls_conf)):
-                cls.append(int(np.argmax(cls_conf[i])))#cls根据置信度最大值记录每个框的类别Id
+            # 直接取类别和置信度
+            cls_ids = np.argmax(class_confs, axis=1)
+            confs = np.max(class_confs, axis=1)
 
-            total_cls = list(set(cls))  # 记录图像内共出现几种物体，
-            output_box = []
-            # 每个预测类别分开考虑
-            for i in range(len(total_cls)):
-                clss = total_cls[i]
-                cls_box = []
-                temp = box[:, :6]#temp 截取了前6列，格式为 [x, y, w, h, conf, class]
-                for j in range(len(cls)):#对于置信度筛选后的每个框
-                    # 记录[x,y,w,h,conf(最大类别概率),class]值
-                    if cls[j] == clss:
-                        temp[j][5] = clss
-                        cls_box.append(temp[j][:6])
-                #  cls_box 里面是[x,y,w,h,conf(最大类别概率),class]，只包含当前class
-                cls_box = np.array(cls_box)
-                sort_cls_box = sorted(cls_box, key=lambda x: -x[4])  # 将cls_box按置信度从大到小排序
+            # 置信度过滤
+            keep_mask = confs > self.conf_thres
+            boxes = boxes[keep_mask]
+            confs = confs[keep_mask]
+            cls_ids = cls_ids[keep_mask]
 
-                # 得到置信度最大的预测框
-                max_conf_box = sort_cls_box[0]
-                output_box.append(max_conf_box)
-                sort_cls_box = np.delete(sort_cls_box, 0, 0)
-                # 对除max_conf_box外其他的框进行非极大值抑制
-                while len(sort_cls_box) > 0:
-                    # 得到当前最大的框
-                    max_conf_box = output_box[-1]
-                    del_index = []
-                    for j in range(len(sort_cls_box)):
-                        current_box = sort_cls_box[j]
-                        iou = self.get_iou(max_conf_box, current_box)
-                        if iou > self.iou_thres:
-                            # 筛选出与当前最大框Iou大于阈值的框的索引
-                            del_index.append(j)
-                    # 删除这些索引
-                    sort_cls_box = np.delete(sort_cls_box, del_index, 0)
-                    if len(sort_cls_box) > 0:
-                        output_box.append(sort_cls_box[0])
-                        sort_cls_box = np.delete(sort_cls_box, 0, 0)
+            # 拼接成 (M,6)
+            detected = np.concatenate([
+                boxes,
+                confs[:, None],
+                cls_ids[:, None]
+            ], axis=1)
 
-            print("最终保留的检测框 output_box:")
-            for i, box in enumerate(output_box):
-                x, y, w, h, conf, cls_id = box
-                print(
-                    f"{i + 1}: 类别ID={int(cls_id)}, 置信度={conf:.4f}, 框=[x={x:.1f}, y={y:.1f}, w={w:.1f}, h={h:.1f}]")
-            return output_box
+            # 后面逐类 NMS 不变…
 
-    def xywh2xyxy(self,*box):
-        """
-        将xywh转换为左上角点和左下角点
-        Args:
-            box:
-        Returns: x1y1x2y2
-        """
-        ret = [box[0] - box[2] // 2, box[1] - box[3] // 2, \
-               box[0] + box[2] // 2, box[1] + box[3] // 2]
-        return ret
-
-    def cod_trf(self,result, pre, after):
-        """
-        因为预测框是在经过letterbox后的图像上做预测所以需要将预测框的坐标映射回原图像上
-        Args:
-            result:  [x,y,w,h,conf(最大类别概率),class]
-            pre:    原尺寸图像
-            after:  经过letterbox处理后的图像
-        Returns: 坐标变换后的结果,
-        """
-        res = np.array(result)
-        x, y, w, h, conf, cls = res.transpose((1, 0))
-        x1, y1, x2, y2 = self.xywh2xyxy(x, y, w, h)  # 左上角点和右下角的点
-        h_pre, w_pre, _ = pre.shape
-        h_after, w_after, _ = after.shape
-        scale = max(w_pre / w_after, h_pre / h_after)  # 缩放比例
-        h_pre, w_pre = h_pre / scale, w_pre / scale  # 计算原图在等比例缩放后的尺寸
-        x_move, y_move = abs(w_pre - w_after) // 2, abs(h_pre - h_after) // 2  # 计算平移的量
-        ret_x1, ret_x2 = (x1 - x_move) * scale, (x2 - x_move) * scale
-        ret_y1, ret_y2 = (y1 - y_move) * scale, (y2 - y_move) * scale
-        ret = np.array([ret_x1, ret_y1, ret_x2, ret_y2, conf, cls]).transpose((1, 0))
-        return ret
-
-    def draw(self,res, image, cls):
-        """
-        将预测框绘制在image上
-        Args:
-            res: 预测框数据
-            image: 原图
-            cls: 类别列表，类似["apple", "banana", "people"]  根据coco映射
-        Returns:
-        """
-        for r in res:
-            # 画框
-            image = cv2.rectangle(image, (int(r[0]), int(r[1])), (int(r[2]), int(r[3])), (255, 0, 0), 1)
-            # 表明类别
-            text = "{}:{}".format(cls[int(r[5])], round(float(r[4]), 2))
-            h, w = int(r[3]) - int(r[1]), int(r[2]) - int(r[0])  # 计算预测框的长宽
-            font_size = min(h / 640, w / 640) * 3  # 计算字体大小（随框大小调整）
-            image = cv2.putText(image, text, (max(10, int(r[0])), max(20, int(r[1]))), cv2.FONT_HERSHEY_COMPLEX,
-                                max(font_size, 0.3), (0, 0, 255), 1)  # max()为了确保字体不过界
-        # 移除cv2.imshow和cv2.waitKey，不再弹窗展示
-        return image
-
-"""
-    def visualize(self, image, result):
-        
-        if isinstance(image, np.ndarray):
-            image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-
-        draw = ImageDraw.Draw(image)
-        try:
-            font = ImageFont.truetype("arial.ttf", 15)
-        except:
-            font = ImageFont.load_default()
-
-        for det in result:
-            x1, y1, x2, y2, conf, cls_id = det
-            cls_id = int(cls_id)
-
-            # 跳过无效框
-            if x2 <= x1 or y2 <= y1 or conf < 0.01:
+            if boxes.shape[0] == 0:
+                results_all.append(([], *meta_list[b]))
                 continue
 
-            # 绘制边界框
-            color = (255, 0, 0)  # 红色
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+            # 2. 拼接成 (M,6)：[x, y, w, h, conf, cls_id]
+            detected = np.concatenate([
+                boxes,
+                confs[:, None],
+                cls_ids[:, None]
+            ], axis=1)   # shape = (M,6)
 
-            # 显示标签
-            if 0 <= cls_id < len(self.coco_names):
-                label = f"{self.coco_names[cls_id]}: {conf:.2f}"
-            else:
-                label = f"unknown({cls_id}): {conf:.2f}"
+            output_box = []
+            # 3. 针对每个类别做 NMS
+            for cls_id in np.unique(detected[:, 5].astype(int)):
+                cls_mask   = detected[:, 5] == cls_id
+                cls_dets   = detected[cls_mask]   # (K,6)
+                # 按 conf 降序
+                order      = np.argsort(-cls_dets[:, 4])
+                cls_dets   = cls_dets[order]
 
-            # 获取文本尺寸
-            if hasattr(draw, 'textbbox'):
-                bbox = draw.textbbox((x1, y1), label, font=font)
-                text_width, text_height = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            else:
-                text_width, text_height = font.getsize(label)
+                keep_idxs = []
+                while cls_dets.shape[0] > 0:
+                    # 保留第一个
+                    keep_idxs.append(cls_dets[0])
+                    if cls_dets.shape[0] == 1:
+                        break
+                    # 计算 IoU 并过滤
+                    ious = np.array([
+                        self.get_iou(cls_dets[0][:4], box[:4])
+                        for box in cls_dets[1:]
+                    ])
+                    idxs = np.where(ious < self.iou_thres)[0] + 1
+                    cls_dets = cls_dets[idxs]
 
-            # 确保标签在图像范围内
-            text_y = max(0, y1 - text_height - 5)
+                output_box.extend(keep_idxs)
 
-            # 绘制标签背景
-            draw.rectangle([x1, text_y, x1 + text_width, text_y + text_height], fill=color)
-            draw.text((x1, text_y), label, fill="white", font=font)
+            # 4. 打印并收集结果
+            print(f"[图像 {b}] 最终保留框数量: {len(output_box)}")
+            for i, box in enumerate(output_box):
+                x, y, w, h, conf, cid = box
+                print(f"  {i+1}: 类别={self.coco_dict[int(cid)]}({int(cid)}), "
+                      f"置信度={conf:.4f}, 框=[{x:.1f},{y:.1f},{w:.1f},{h:.1f}]")
+
+            results_all.append((output_box, *meta_list[b]))
+
+        return results_all
+
+    def cod_trf_batch(self, results_all, orig_imgs, padded_imgs):
+        """
+        将每张图片的检测框从 letterbox 映射回原图坐标
+        :param results_all: [(output_box, dw, dh, r, w0, h0), ...]
+        :param orig_imgs: 原图列表
+        :param padded_imgs: 经过 letterbox 的图像列表
+        :return: List[np.array] -> 每张图的转换后框 (x1,y1,x2,y2,conf,cls)
+        """
+        transformed_results = []
+
+        for i, (result, dw, dh, r, w0, h0) in enumerate(results_all):
+            if not result:
+                transformed_results.append([])
+                continue
+
+            res = []
+            h_pad, w_pad = padded_imgs[i].shape[:2]
+
+            scale = min(w_pad / w0, h_pad / h0)
+            new_w = int(w0 * scale)
+            new_h = int(h0 * scale)
+            pad_x = (w_pad - new_w) / 2
+            pad_y = (h_pad - new_h) / 2
+
+            for box in result:
+                x, y, w, h, conf, cls_id = box
+
+                # 反 letterbox
+                x_orig = (x - pad_x) / scale
+                y_orig = (y - pad_y) / scale
+                w_orig = w / scale
+                h_orig = h / scale
+
+                x1, y1, x2, y2 = self.xywh2xyxy(x_orig, y_orig, w_orig, h_orig)
+
+                # clip 到原图尺寸
+                img_h, img_w = orig_imgs[i].shape[:2]
+                x1 = max(0, min(img_w - 1, x1))
+                y1 = max(0, min(img_h - 1, y1))
+                x2 = max(0, min(img_w - 1, x2))
+                y2 = max(0, min(img_h - 1, y2))
+
+                res.append([x1, y1, x2, y2, conf, cls_id])
+
+            transformed_results.append(np.array(res))
+
+        return transformed_results
+
+    def draw(self, res, image, cls):
+        """
+        将预测框绘制在 image 上
+        Args:
+            res: 预测框数据 (x1, y1, x2, y2, conf, class_id)
+            image: 原图
+            cls: 类别列表（索引->名称映射，例如 coco.names）
+        Returns:
+            绘制后的图像
+        """
+        for r in res:
+            x1, y1, x2, y2, conf, class_id = r
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            class_id = int(class_id)
+
+            # 绘制边框
+            color = (0, 255, 0)
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+
+            # 准备标签文本
+            class_name = cls[class_id] if class_id < len(cls) else f"id_{class_id}"
+            text = f"{class_name}: {conf:.2f}"
+
+            # 文字大小和位置
+            font_scale = max(min((y2 - y1) / 300, 1.0), 0.4)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            thickness = 1
+            text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+            text_origin = (x1, y1 - 10 if y1 - 10 > 10 else y1 + 10)
+
+            # 背景填充
+            cv2.rectangle(image,
+                          (text_origin[0], text_origin[1] - text_size[1] - 4),
+                          (text_origin[0] + text_size[0] + 4, text_origin[1] + 4),
+                          color, -1)
+            # 添加文字
+            cv2.putText(image, text, (text_origin[0] + 2, text_origin[1]),
+                        font, font_scale, (0, 0, 0), thickness=1, lineType=cv2.LINE_AA)
 
         return image
+
+    def post_pipeline(self, preds, meta_list, orig_imgs, padded_imgs):
         """
+        完整的后处理管道
+        Args:
+            preds: 模型预测结果，shape=(B,84,8400)
+            meta_list: 元数据列表，包含 (dw, dh, r, w0, h0)
+            orig_imgs: 原始图片列表
+            padded_imgs: letterbox 后的图片列表
+        Returns:
+            mapped_results: List[np.array]，每张图的框 (x1,y1,x2,y2,conf,cls)
+            drawn_imgs: List[np.array]，在原图上画完框的图
+        """
+        # 1. NMS、filter 得到每张图的原始框（格式：[[x,y,w,h,conf,cls],…]）
+        results_all = self.post_process(preds, meta_list)
+
+        # 2. 把框映射回原图
+        mapped_results = self.cod_trf_batch(results_all, orig_imgs, padded_imgs)
+
+
+        # 3. 打印每张图的检测框
+        for idx, boxes in enumerate(mapped_results):
+            print(f"[Image {idx}] 检测到 {len(boxes)} 个框：")
+            for b in boxes:
+                x1, y1, x2, y2, conf, cls_id = b
+                print(f"    cls={self.coco_dict[int(cls_id)]}({int(cls_id)}), "
+                      f"conf={conf:.3f}, box=({x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f})")
+
+        # 4. 在原图上画框
+        drawn_imgs = []
+        for img, boxes in zip(orig_imgs, mapped_results):
+            drawn = self.draw(boxes, img.copy(), self.coco_names)
+            drawn_imgs.append(drawn)
+
+        return mapped_results, drawn_imgs
