@@ -1,9 +1,5 @@
 import cv2
 import numpy as np
-import torch
-import torchvision
-
-from PIL import Image, ImageDraw, ImageFont
 
 
 class YOLOv8PostProcessor:
@@ -189,13 +185,11 @@ class YOLOv8PostProcessor:
                 continue
 
             res = []
-            h_pad, w_pad = padded_imgs[i].shape[:2]
-
-            scale = min(w_pad / w0, h_pad / h0)
-            new_w = int(w0 * scale)
-            new_h = int(h0 * scale)
-            pad_x = (w_pad - new_w) / 2
-            pad_y = (h_pad - new_h) / 2
+            # 用 letterbox 时记录的 (dw, dh, r) 还原；原代码用 int() 重算 scale/pad，
+            # 与预处理的取整方式不一致，会产生 1px 级偏移
+            scale = r
+            pad_x = int(round(dw - 0.1))
+            pad_y = int(round(dh - 0.1))
 
             for box in result:
                 x, y, w, h, conf, cls_id = box

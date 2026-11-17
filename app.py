@@ -7,6 +7,8 @@ import numpy as np
 
 import preProcessor
 
+MODEL_PATH = os.environ.get("MODEL_PATH", "yolov8n.onnx")
+
 app = FastAPI()
 
 @app.get("/")
@@ -30,23 +32,20 @@ def convert_to_serializable(obj):
 
 @app.post("/YOLOpredict/")
 async def predict(file: UploadFile = File(...)):
-    temp_path = f"runs/uploaded/{file.filename}"
+    # 只取文件名部分，防止 "../../xxx" 这类文件名写到上传目录之外
+    filename = os.path.basename(file.filename or "upload.jpg")
     os.makedirs("runs/uploaded", exist_ok=True)
-    os.makedirs("runs/detect/myPredict", exist_ok=True)
+    temp_path = os.path.join("runs/uploaded", filename)
 
     with open(temp_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    result = preProcessor.ini(temp_path)
+    result = preProcessor.ini(temp_path, model_path=MODEL_PATH)
 
     result = convert_to_serializable(result)
 
     return JSONResponse(content=result)
 
 
-
-
-
-
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)

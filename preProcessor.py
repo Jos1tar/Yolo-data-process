@@ -3,15 +3,18 @@ import numpy as np
 import matplotlib.pyplot as plt
 import onnxruntime as rt
 import os
-import math
+from functools import lru_cache
 import openvino as ov
-#from openvino.tools import mo
-import torch
+
+try:  # torch 只在 xyxy2xywh 的类型判断里用到，可选
+    import torch
+except ImportError:  # pragma: no cover
+    torch = None
 
 import opPostprocessor
 
 
-def preprocess_and_display(img_path, img_size=640):
+def preprocess_and_display(img_path, img_size=640, show=False):
     """
     图像预处理和显示流程（不包含模型推理）
 
@@ -37,8 +40,8 @@ def preprocess_and_display(img_path, img_size=640):
     # 3. 图像缩放（保持长宽比）
     r = img_size / max(h0, w0)  # 计算缩放比例
     if r != 1:  # 需要缩放
-        interp = cv2.INTER_LINEAR if r > 1 else cv2.INTER_AREA  # 上采样用线性，下采样用区域
-        resized_img = cv2.resize(img, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+        interp = cv2.INTER_LINEAR  # 与 ultralytics 一致；原来下采样用 INTER_AREA，conf 会差约 0.01
+        resized_img = cv2.resize(img, (min(img_size, round(w0 * r)), min(img_size, round(h0 * r))), interpolation=interp)
     else:
         resized_img = img.copy()
 
@@ -59,7 +62,18 @@ def preprocess_and_display(img_path, img_size=640):
         cv2.BORDER_CONSTANT, value=color
     )
 
-    # 5. 显示处理过程
+    # 5. 显示处理过程（服务端调用时 show=False，否则 plt.show() 会阻塞请求）
+    if show:
+        _show_steps(orig_img, resized_img, padded_img, w0, h0, w1, h1)
+
+    # 6. 转换为模型输入格式（不执行推理）
+    input_tensor = padded_img.transpose((2, 0, 1))
+    input_tensor = np.ascontiguousarray(input_tensor)
+    input_tensor = np.expand_dims(input_tensor, axis=0).astype(np.float32) / 255.0
+    return input_tensor, orig_img, resized_img, padded_img, (dw, dh, r, w0, h0)
+
+
+def _show_steps(orig_img, resized_img, padded_img, w0, h0, w1, h1):
     plt.figure(figsize=(15, 5))
 
     plt.subplot(1, 3, 1)
@@ -79,19 +93,6 @@ def preprocess_and_display(img_path, img_size=640):
 
     plt.tight_layout()
     plt.show()
-
-    # 6. 转换为模型输入格式（不执行推理）
-    # HWC to CHW (Height, Width, Channel -> Channel, Height, Width)
-    input_tensor = padded_img.transpose((2, 0, 1))
-    # 转换为连续内存
-    input_tensor = np.ascontiguousarray(input_tensor)
-    # 添加batch维度并归一化
-    input_tensor = np.expand_dims(input_tensor, axis=0).astype(np.float32) / 255.0
-
-    print(f"预处理后的张量形状: {input_tensor.shape} (B,C,H,W)")
-    print(f"像素值范围: {input_tensor.min():.4f} - {input_tensor.max():.4f}")
-
-    return input_tensor, orig_img, resized_img, padded_img, (dw, dh, r, w0, h0)
 
 
 def run_inference(input_tensor, xml_path, device="CPU"):
@@ -121,7 +122,7 @@ def run_inference(input_tensor, xml_path, device="CPU"):
 # （左上角坐标，右下角坐标）转 （检测框中心坐标，检测框宽高）
 def xyxy2xywh(x):
     """Convert nx4 boxes from [x1, y1, x2, y2] to [x, y, w, h] where xy1=top-left, xy2=bottom-right."""
-    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y = x.clone() if torch is not None and isinstance(x, torch.Tensor) else np.copy(x)
     y[..., 0] = (x[..., 0] + x[..., 2]) / 2  # x center
     y[..., 1] = (x[..., 1] + x[..., 3]) / 2  # y center
     y[..., 2] = x[..., 2] - x[..., 0]  # width
@@ -152,39 +153,34 @@ def std_output(pred):
 
 
 
-def ini(image_path: str = "runs/true.jpg"):
-    img = cv2.imread(image_path)
-    if img is None:
-        raise ValueError(f"无法读取图像：{image_path}")
+@lru_cache(maxsize=4)
+def _get_session(model_path):
+    return rt.InferenceSession(model_path, providers=["CPUExecutionProvider"])
 
+
+def ini(image_path: str = "runs/true.jpg", model_path: str = "yolov8n.onnx"):
     try:
-        input_tensor, orig_img, resized_img, padded_img, (dw, dh, r, w0, h0) = preprocess_and_display(
-            image_path, img_size=640
-        )
+        input_tensor, orig_img, resized_img, padded_img, meta = preprocess_and_display(image_path, img_size=640)
 
         # 载入 ONNX 模型并进行推理
-        sess = rt.InferenceSession('yolov8n.onnx')
+        sess = _get_session(model_path)  # 原来每个请求都重新创建 InferenceSession
         input_name = sess.get_inputs()[0].name
-        label_name = sess.get_outputs()[0].name
-        pred = sess.run([label_name], {input_name: input_tensor})[0]
+        pred = sess.run(None, {input_name: input_tensor})[0]
 
-        # 后处理
+        # 后处理（原代码调用了不存在的 cod_trf 且 post_process 参数签名不匹配）
         postprocessor = opPostprocessor.YOLOv8PostProcessor(conf_thres=0.5, iou_thres=0.4)
-        results = postprocessor.post_process(pred, dw, dh, r, w0, h0)
-        result = postprocessor.cod_trf(results, img, padded_img)
-        image = postprocessor.draw(result, img, postprocessor.coco_dict)
+        mapped, drawn = postprocessor.post_pipeline(pred, [meta], [orig_img], [padded_img])
+        result = mapped[0]
 
-        # 输出路径
-        out_path = "runs/detect/myPredict/"
-        save_path = out_path + image_path.split("/")[-1]
-        cv2.imwrite(save_path, image)
+        out_dir = "runs/detect/myPredict"
+        os.makedirs(out_dir, exist_ok=True)
+        save_path = os.path.join(out_dir, os.path.basename(image_path))
+        cv2.imwrite(save_path, drawn[0])
         print(f"结果保存至 {save_path}")
         return {"status": "success", "save_path": save_path, "results": result}
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
-
-
 
 
 if __name__ == "__main__":
